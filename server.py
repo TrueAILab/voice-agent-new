@@ -15,6 +15,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from typing import Any
 from urllib.parse import parse_qsl
@@ -53,34 +54,56 @@ log = logging.getLogger("twilio-gemini-bridge")
 app = FastAPI(title="TrueAI Lab Twilio Gemini Bridge")
 
 
-SYSTEM_PROMPT = """You are Jake, a friendly and professional AI voice agent for TrueAI Lab — an AI engineering company that builds production-grade voice AI agents, workflow automation, and intelligent systems for businesses.
+SYSTEM_PROMPT = """You are Maya, the AI receptionist for TrueAI Lab. You sound like a real, experienced front-desk receptionist - warm, natural, confident, and never robotic or pushy.
 
-## YOUR ROLE
-You are an inbound sales agent on a live phone call. When the call connects, YOU speak first with a warm, fast greeting. You're selling TrueAI Lab's voice AI agent building services.
+HOW TO SPEAK
+- Keep every response short and conversational. Prefer 1-2 short sentences, and only go longer if the caller asks for more.
+- Never read out lists or sound scripted.
+- Never say things like "I have noted your details" or "I will proceed." Just do it and confirm naturally.
+- Use the caller's name occasionally, but not in every sentence.
+- Never repeat yourself.
+- If the caller asks you to speak in Tamil, switch to casual Chennai Tamil without any formal or ancient tamil usage.
 
-## INITIAL GREETING
-"Hey there! Thanks for calling TrueAI Lab. I'm Jake, and I help businesses like yours get set up with custom AI voice agents. Whether it's handling customer calls, booking appointments, or automating your front desk — we build it all. How can I help you today?"
+STARTING THE CALL
+- Always open with this exact short greeting: "Hi, this is Jake from TrueAI Lab. How can I help you today?"
+- Do not ask for a name or phone number at the start. Just listen first.
+- Never repeat the full greeting if interrupted.
 
-## CONVERSATION FLOW
-1. Start with the greeting above — naturally and quickly.
-2. Listen carefully and understand what the caller needs.
-3. Naturally collect:
-   - Full name
-   - Phone number
-   - Email address
-   - Their specific use case
-4. Once you have all four pieces of information, call save_lead.
-5. After saving, say: "Awesome, I've got everything noted down. One of our engineers will reach out to you within 24 hours to discuss your project in detail. Thanks for reaching out to TrueAI Lab!"
+ABOUT TRUEAI LAB
+- TrueAI Lab builds production-grade AI voice agents, workflow automation, and intelligent systems for businesses.
+- When someone asks if the company is good or trustworthy, answer warmly and confidently like a proud team member.
+- When someone asks about services or pricing, explain conversationally using your knowledge of TrueAI Lab. Never answer as a list.
+- If pricing comes up, say it depends on the complexity and an engineer will walk them through options that fit their needs.
+- Stay focused on the caller and their use case. Do not drift into generic AI explanations.
 
-## STYLE
-- Keep responses short because this is a phone call
-- Ask for one thing at a time
-- Be warm, confident, and natural
-- Never repeat the full greeting if interrupted
-- If asked about pricing, say pricing depends on complexity and an engineer will walk them through options
-- If they are not interested, end politely and briefly
-- Stay focused on the caller and their use case"""
+COLLECTING DETAILS
+- Only collect details when the caller clearly wants follow-up, a meeting, a callback, or serious project discussion.
+- Collect in this order: full name, phone number, email address, then their specific use case.
+- Ask for only one detail at a time.
+- After the caller gives their name, confirm it naturally: "Got it - just to confirm, that's [Name], right?"
+- If they correct the name, acknowledge it naturally and use the corrected version.
+- After the caller gives their email, read it back naturally and confirm it once.
+- Always collect the phone number with country code. If it is missing, ask once naturally: "Could you include your country code as well?"
+- Never ask for the same detail again once it has been confirmed.
 
+WEBHOOK AND TOOL RULES
+- The only available tool is save_lead, which sends the existing webhook.
+- Calling save_lead is mandatory once you have name, phone, email, and use_case.
+- The moment you have all four fields, call save_lead before the final confirmation.
+- Before calling the tool, say naturally: "Just a moment" or "Let me check that for you."
+- Do not mention the tool or webhook to the caller.
+- If the tool fails, say: "I'm sorry about that - let me try that again."
+
+AFTER THE WEBHOOK IS DONE
+- Keep it minimal and natural.
+- After save_lead succeeds, say something like: "Perfect, you're all set. We'll be in touch soon. Do you need any other help today?"
+- Keep that short. Do not give a long closing unless the caller is ready to end the call.
+
+IMPORTANT RULES
+- Never ask more than one question at a time.
+- Never suggest booking a meeting unless the caller brings it up.
+- If they are not interested, be gracious and brief.
+"""
 
 def call_n8n_webhook(lead_data: dict[str, Any]) -> dict[str, Any]:
     """POST lead data to n8n webhook. Returns success/error status."""
@@ -111,6 +134,148 @@ def call_n8n_webhook(lead_data: dict[str, Any]) -> dict[str, Any]:
     except requests.RequestException as exc:
         log.error(f"Webhook failed: {exc}")
         return {"success": False, "error": str(exc)}
+
+
+def _normalize_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _extract_email(text: str) -> str | None:
+    match = re.search(r"[\w.\-+%]+@[\w.\-]+\.\w+", text)
+    return match.group(0) if match else None
+
+
+def _extract_phone(text: str) -> str | None:
+    digits = re.sub(r"\D", "", text)
+    if len(digits) < 10:
+        return None
+    if len(digits) == 10:
+        return digits
+    return f"+{digits}"
+
+
+def _clean_name(text: str) -> str:
+    cleaned = re.sub(
+        r"^(my name is|this is|i am|i'm|im|it is|it's|hi i'm|hello i'm|hey i'm)\s+",
+        "",
+        text.strip(),
+        flags=re.IGNORECASE,
+    )
+    # Stop before email address (@ sign or "at gmail/yahoo/...") so email doesn't pollute name
+    cleaned = re.split(r"\s*@|\s+at\s+\w+\.\w+", cleaned, maxsplit=1)[0]
+    # Keep only letters, spaces, apostrophes, hyphens, dots — no digits
+    cleaned = re.sub(r"\d+", "", cleaned)
+    cleaned = re.sub(r"[^\w\s'.-]", "", cleaned)
+    return _normalize_spaces(cleaned)
+
+
+_GREETING_RE = re.compile(
+    r"^(hi\b|hello\b|hey\b|yeah\s+(hi|hello|okay)|good\s+(morning|afternoon|evening)|how\s+are\s+you)",
+    re.IGNORECASE,
+)
+
+
+def _is_greeting_or_question(text: str) -> bool:
+    """Return True if the text is a greeting or short question — not a real use-case."""
+    if _GREETING_RE.match(text):
+        return True
+    # Short questions like "So what about solutions you sell?" are not use-cases
+    if text.endswith("?") and len(text.split()) <= 15:
+        return True
+    return False
+
+
+def _clean_use_case(text: str) -> str:
+    cleaned = re.sub(
+        r"^(we need|i need|we want|i want|it's for|it is for|we are looking for)\s+",
+        "",
+        text.strip(),
+        flags=re.IGNORECASE,
+    )
+    return _normalize_spaces(cleaned)
+
+
+class LeadState:
+    def __init__(self):
+        self.name = ""
+        self.phone = ""
+        self.email = ""
+        self.use_case = ""
+        self.saved = False
+        self.expected_field = "use_case"
+
+    def update_expected_field(self, agent_text: str):
+        text = agent_text.lower()
+        if any(phrase in text for phrase in [
+            "full name", "your name", "who am i speaking with", "who's this",
+            "can i grab your name", "may i have your name", "what's your name",
+            "first name", "get your name", "i have your name",
+        ]):
+            self.expected_field = "name"
+        elif any(phrase in text for phrase in ["phone number", "best number", "reach you at", "contact number"]):
+            self.expected_field = "phone"
+        elif "email" in text:
+            self.expected_field = "email"
+        elif any(phrase in text for phrase in ["use case", "what do you want", "what would you like", "what should the voice agent do"]):
+            self.expected_field = "use_case"
+
+    def merge(self, data: dict[str, Any]):
+        for key in ("name", "phone", "email", "use_case"):
+            value = _normalize_spaces(str(data.get(key, "")))
+            if value:
+                setattr(self, key, value)
+
+    def consume_caller_text(self, caller_text: str):
+        text = _normalize_spaces(caller_text)
+        if not text:
+            return
+
+        email = _extract_email(text)
+        phone = _extract_phone(text)
+        if email and not self.email:
+            self.email = email
+        if phone and not self.phone:
+            self.phone = phone
+
+        if self.expected_field == "name":
+            candidate = _clean_name(text)
+            # Accept candidate if it has at least one real letter and 2+ chars.
+            # Always overwrite when expected_field is "name" so a later, accurate
+            # utterance ("it's Saravana Iyyappan") replaces an earlier bad capture.
+            if candidate and len(candidate) >= 2 and re.search(r"[a-zA-Z]", candidate):
+                self.name = candidate
+        elif self.expected_field == "phone" and not self.phone and phone:
+            self.phone = phone
+        elif self.expected_field == "email" and not self.email and email:
+            self.email = email
+        elif self.expected_field == "use_case" and not self.use_case:
+            cleaned = _clean_use_case(text)
+            # Don't store a greeting or a short question as the use-case
+            if cleaned and not _is_greeting_or_question(cleaned):
+                self.use_case = cleaned
+
+    def has_all_fields(self) -> bool:
+        return all([self.name, self.phone, self.email, self.use_case])
+
+    def missing_fields(self) -> list[str]:
+        missing = []
+        if not self.name:
+            missing.append("name")
+        if not self.phone:
+            missing.append("phone")
+        if not self.email:
+            missing.append("email")
+        if not self.use_case:
+            missing.append("use_case")
+        return missing
+
+    def as_payload(self) -> dict[str, str]:
+        return {
+            "name": self.name,
+            "phone": self.phone,
+            "email": self.email,
+            "use_case": self.use_case,
+        }
 
 
 def build_public_base_url(request: Request) -> str:
@@ -230,6 +395,8 @@ class TwilioGeminiBridge:
         self.gemini_ready = asyncio.Event()
         self.incoming_audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=100)
         self.mark_counter = 0
+        self.lead_state = LeadState()
+        self.session_handle: str | None = None
 
     def _build_setup_message(self) -> dict[str, Any]:
         return {
@@ -239,7 +406,7 @@ class TwilioGeminiBridge:
                     "responseModalities": ["AUDIO"],
                     "speechConfig": {
                         "voiceConfig": {
-                            "prebuiltVoiceConfig": {"voiceName": "Puck"}
+                            "prebuiltVoiceConfig": {"voiceName": "Aoede"}
                         }
                     },
                     "temperature": 0.7,
@@ -252,16 +419,32 @@ class TwilioGeminiBridge:
                             {
                                 "name": "save_lead",
                                 "description": (
-                                    "Save a qualified lead to the CRM after collecting "
-                                    "name, phone, email, and use_case."
+                                    "Save a qualified lead's information to the CRM. "
+                                    "Call this ONLY when you have collected ALL four "
+                                    "pieces of information: name, phone, email, and use_case."
                                 ),
                                 "parameters": {
                                     "type": "OBJECT",
                                     "properties": {
-                                        "name": {"type": "STRING"},
-                                        "phone": {"type": "STRING"},
-                                        "email": {"type": "STRING"},
-                                        "use_case": {"type": "STRING"},
+                                        "name": {
+                                            "type": "STRING",
+                                            "description": "The caller's full name",
+                                        },
+                                        "phone": {
+                                            "type": "STRING",
+                                            "description": "The caller's phone number with country code",
+                                        },
+                                        "email": {
+                                            "type": "STRING",
+                                            "description": "The caller's email address",
+                                        },
+                                        "use_case": {
+                                            "type": "STRING",
+                                            "description": (
+                                                "What the caller wants to use the voice agent for - "
+                                                "a brief summary of their use case"
+                                            ),
+                                        },
                                     },
                                     "required": ["name", "phone", "email", "use_case"],
                                 },
@@ -272,14 +455,31 @@ class TwilioGeminiBridge:
                 "realtimeInputConfig": {
                     "automaticActivityDetection": {
                         "disabled": False,
+                        # HIGH sensitivity = faster detection (critical for sales calls)
                         "startOfSpeechSensitivity": "START_SENSITIVITY_HIGH",
                         "endOfSpeechSensitivity": "END_SENSITIVITY_HIGH",
+                        # Low prefix padding = detect speech start faster
                         "prefixPaddingMs": 80,
+                        # Moderate silence = don't cut off mid-thought
                         "silenceDurationMs": 600,
                     },
+                    # Barge-in enabled - caller can interrupt the agent
                     "activityHandling": "START_OF_ACTIVITY_INTERRUPTS",
+                    # Only include active speech, not silence
                     "turnCoverage": "TURN_INCLUDES_ONLY_ACTIVITY",
                 },
+                # Session resumption for reconnect resilience
+                "sessionResumption": (
+                    {"handle": self.session_handle}
+                    if self.session_handle
+                    else {}
+                ),
+                # Context compression for long calls
+                "contextWindowCompression": {
+                    "slidingWindow": {"targetTokens": 20000},
+                    "triggerTokens": 40000,
+                },
+                # Enable transcription for logging
                 "inputAudioTranscription": {},
                 "outputAudioTranscription": {},
             }
@@ -307,7 +507,7 @@ class TwilioGeminiBridge:
             json.dumps(
                 {
                     "realtimeInput": {
-                        "text": "The phone call has connected. Deliver your greeting immediately."
+                        "text": "The phone call has connected. Greet the caller now as Jake from TrueAI Lab."
                     }
                 }
             )
@@ -351,7 +551,18 @@ class TwilioGeminiBridge:
 
             log.info(f"Tool call received: {fn_name}")
             if fn_name == "save_lead":
-                result = call_n8n_webhook(fn_args)
+                self.lead_state.merge(fn_args)
+                if self.lead_state.saved:
+                    result = {"success": True, "message": "Lead already saved successfully"}
+                elif self.lead_state.has_all_fields():
+                    result = call_n8n_webhook(self.lead_state.as_payload())
+                    if result.get("success"):
+                        self.lead_state.saved = True
+                else:
+                    result = {
+                        "success": False,
+                        "error": f"Missing required fields: {', '.join(self.lead_state.missing_fields())}",
+                    }
             else:
                 result = {"error": f"Unknown function: {fn_name}"}
 
@@ -359,6 +570,30 @@ class TwilioGeminiBridge:
 
         await self.gemini_ws.send(
             json.dumps({"toolResponse": {"functionResponses": responses}})
+        )
+
+    async def maybe_save_lead_fallback(self) -> None:
+        if self.lead_state.saved or not self.lead_state.has_all_fields() or not self.gemini_ws:
+            return
+
+        result = call_n8n_webhook(self.lead_state.as_payload())
+        if not result.get("success"):
+            return
+
+        self.lead_state.saved = True
+        log.info("Lead auto-saved by fallback webhook logic")
+        await self.gemini_ws.send(
+            json.dumps(
+                {
+                    "realtimeInput": {
+                        "text": (
+                            "System note: the lead has already been saved successfully. "
+                            "Briefly confirm that an engineer will reach out within 24 hours, "
+                            "and do not ask for the same contact details again."
+                        )
+                    }
+                }
+            )
         )
 
     async def twilio_to_bridge(self) -> None:
@@ -474,11 +709,23 @@ class TwilioGeminiBridge:
                         text = sc["inputTranscription"].get("text", "").strip()
                         if text:
                             log.info(f"Caller: {text}")
+                            self.lead_state.consume_caller_text(text)
+                            await self.maybe_save_lead_fallback()
 
                     if "outputTranscription" in sc:
                         text = sc["outputTranscription"].get("text", "").strip()
                         if text:
                             log.info(f"Agent: {text}")
+                            self.lead_state.update_expected_field(text)
+
+                if "sessionResumptionUpdate" in msg:
+                    update = msg["sessionResumptionUpdate"]
+                    if update.get("resumable"):
+                        self.session_handle = update["newHandle"]
+                        log.debug("Session handle cached for reconnect")
+
+                if "goAway" in msg:
+                    log.warning(f"Server GoAway: {msg['goAway'].get('timeLeft')}")
 
         except websockets.ConnectionClosed as exc:
             log.info(f"Gemini connection closed: {exc.code} - {exc.reason}")

@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 from datetime import datetime
@@ -61,38 +62,57 @@ log = logging.getLogger("voice-agent")
 
 # ─── System Prompt ────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are Jake, a friendly and professional AI voice agent for TrueAI Lab — an AI engineering company that builds production-grade voice AI agents, workflow automation, and intelligent systems for businesses.
 
-## YOUR ROLE
-You are an inbound sales agent. When the call connects, YOU speak first with a warm, fast greeting. You're selling TrueAI Lab's voice AI agent building services.
+SYSTEM_PROMPT = """You are Jake, the AI receptionist for TrueAI Lab. You sound like a real, experienced front-desk receptionist - warm, natural, confident, and never robotic or pushy.
 
-## INITIAL GREETING (speak this IMMEDIATELY, quickly, and naturally)
-"Hey there! Thanks for calling TrueAI Lab. I'm Jake, and I help businesses like yours get set up with custom AI voice agents. Whether it's handling customer calls, booking appointments, or automating your front desk — we build it all. How can I help you today?"
+HOW TO SPEAK
+- Keep every response short and conversational. Prefer 1-2 short sentences, and only go longer if the caller asks for more.
+- Never read out lists or sound scripted.
+- Never say things like "I have noted your details" or "I will proceed." Just do it and confirm naturally.
+- Use the caller's name occasionally, but not in every sentence.
+- Never repeat yourself.
+- If the caller asks you to speak in Tamil, switch to casual Chennai Tamil without any formal or ancient tamil usage.
 
-## CONVERSATION FLOW
-1. Start with the greeting above — deliver it naturally and quickly
-2. Listen to what the caller needs, show genuine interest
-3. Once you understand their interest, naturally collect their information:
-   - Full name
-   - Phone number
-   - Email address
-   - Their specific use case (what they want the voice agent to do)
-4. Once you have ALL four pieces of info, use the save_lead tool to save it
-5. After saving, confirm: "Awesome, I've got everything noted down. One of our engineers will reach out to you within 24 hours to discuss your project in detail. Thanks for reaching out to TrueAI Lab!"
+STARTING THE CALL
+- Always open with this exact short greeting: "Hi, this is Jake from TrueAI Lab. How can I help you today?"
+- Do not ask for a name or phone number at the start. Just listen first.
+- Never repeat the full greeting if interrupted.
 
-## CONVERSATION STYLE
-- Be conversational, warm, and confident — not robotic or scripted
-- Keep responses SHORT (1-2 sentences max) — this is a voice call, not an essay
-- Ask for ONE piece of information at a time, don't overwhelm
-- If they seem hesitant, briefly mention a success story or benefit
-- Mirror their energy — if they're excited, match it; if they're chill, be chill
-- Use natural filler like "Got it", "Perfect", "Awesome" between info collection
+ABOUT TRUEAI LAB
+- TrueAI Lab builds production-grade AI voice agents, workflow automation, and intelligent systems for businesses.
+- When someone asks if the company is good or trustworthy, answer warmly and confidently like a proud team member.
+- When someone asks about services or pricing, explain conversationally using your knowledge of TrueAI Lab. Never answer as a list.
+- If pricing comes up, say it depends on the complexity and an engineer will walk them through options that fit their needs.
+- Stay focused on the caller and their use case. Do not drift into generic AI explanations.
 
-## IMPORTANT RULES
-- NEVER repeat the full greeting if interrupted
-- If they ask about pricing, say "Pricing depends on the complexity — our engineer will walk you through options that fit your budget"
-- If they're not interested, be gracious: "No worries at all! If you ever need a voice AI solution, TrueAI Lab is here. Have a great day!"
-- Stay focused — don't go off on tangents about AI technology"""
+COLLECTING DETAILS
+- Only collect details when the caller clearly wants follow-up, a meeting, a callback, or serious project discussion.
+- Collect in this order: full name, phone number, email address, then their specific use case.
+- Ask for only one detail at a time.
+- After the caller gives their name, confirm it naturally: "Got it - just to confirm, that's [Name], right?"
+- If they correct the name, acknowledge it naturally and use the corrected version.
+- After the caller gives their email, read it back naturally and confirm it once.
+- Always collect the phone number with country code. If it is missing, ask once naturally: "Could you include your country code as well?"
+- Never ask for the same detail again once it has been confirmed.
+
+WEBHOOK AND TOOL RULES
+- The only available tool is save_lead, which sends the existing webhook.
+- Calling save_lead is mandatory once you have name, phone, email, and use_case.
+- The moment you have all four fields, call save_lead before the final confirmation.
+- Before calling the tool, say naturally: "Just a moment" or "Let me check that for you."
+- Do not mention the tool or webhook to the caller.
+- If the tool fails, say: "I'm sorry about that - let me try that again."
+
+AFTER THE WEBHOOK IS DONE
+- Keep it minimal and natural.
+- After save_lead succeeds, say something like: "Perfect, you're all set. We'll be in touch soon. Do you need any other help today?"
+- Keep that short. Do not give a long closing unless the caller is ready to end the call.
+
+IMPORTANT RULES
+- Never ask more than one question at a time.
+- Never suggest booking a meeting unless the caller brings it up.
+- If they are not interested, be gracious and brief.
+"""
 
 # ─── Audio Playback (non-blocking, interruptible) ────────────
 
@@ -220,6 +240,116 @@ def call_n8n_webhook(lead_data: dict) -> dict:
         return {"success": False, "error": str(e)}
 
 
+def _normalize_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _extract_email(text: str) -> str | None:
+    match = re.search(r"[\w.\-+%]+@[\w.\-]+\.\w+", text)
+    return match.group(0) if match else None
+
+
+def _extract_phone(text: str) -> str | None:
+    digits = re.sub(r"\D", "", text)
+    if len(digits) < 10:
+        return None
+    if len(digits) == 10:
+        return digits
+    return f"+{digits}"
+
+
+def _clean_name(text: str) -> str:
+    cleaned = re.sub(
+        r"^(my name is|this is|i am|i'm|im|it is|it's)\s+",
+        "",
+        text.strip(),
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"[^\w\s'.-]", "", cleaned)
+    return _normalize_spaces(cleaned)
+
+
+def _clean_use_case(text: str) -> str:
+    cleaned = re.sub(
+        r"^(we need|i need|we want|i want|it's for|it is for|we are looking for)\s+",
+        "",
+        text.strip(),
+        flags=re.IGNORECASE,
+    )
+    return _normalize_spaces(cleaned)
+
+
+class LeadState:
+    def __init__(self):
+        self.name = ""
+        self.phone = ""
+        self.email = ""
+        self.use_case = ""
+        self.saved = False
+        self.expected_field = "use_case"
+
+    def update_expected_field(self, agent_text: str):
+        text = agent_text.lower()
+        if any(phrase in text for phrase in ["full name", "your name", "who am i speaking with", "who's this"]):
+            self.expected_field = "name"
+        elif any(phrase in text for phrase in ["phone number", "best number", "reach you at"]):
+            self.expected_field = "phone"
+        elif "email" in text:
+            self.expected_field = "email"
+        elif any(phrase in text for phrase in ["use case", "what do you want", "what would you like", "what should the voice agent do"]):
+            self.expected_field = "use_case"
+
+    def merge(self, data: dict):
+        for key in ("name", "phone", "email", "use_case"):
+            value = _normalize_spaces(str(data.get(key, "")))
+            if value:
+                setattr(self, key, value)
+
+    def consume_caller_text(self, caller_text: str):
+        text = _normalize_spaces(caller_text)
+        if not text:
+            return
+
+        email = _extract_email(text)
+        phone = _extract_phone(text)
+        if email and not self.email:
+            self.email = email
+        if phone and not self.phone:
+            self.phone = phone
+
+        if self.expected_field == "name" and not self.name:
+            self.name = _clean_name(text)
+        elif self.expected_field == "phone" and not self.phone and phone:
+            self.phone = phone
+        elif self.expected_field == "email" and not self.email and email:
+            self.email = email
+        elif self.expected_field == "use_case" and not self.use_case:
+            self.use_case = _clean_use_case(text)
+
+    def has_all_fields(self) -> bool:
+        return all([self.name, self.phone, self.email, self.use_case])
+
+    def missing_fields(self) -> list[str]:
+        missing = []
+        if not self.name:
+            missing.append("name")
+        if not self.phone:
+            missing.append("phone")
+        if not self.email:
+            missing.append("email")
+        if not self.use_case:
+            missing.append("use_case")
+        return missing
+
+    def as_payload(self) -> dict:
+        return {
+            "name": self.name,
+            "phone": self.phone,
+            "email": self.email,
+            "use_case": self.use_case,
+        }
+
+
 # ─── Voice Agent ──────────────────────────────────────────────
 
 class VoiceAgent:
@@ -237,6 +367,7 @@ class VoiceAgent:
         self.mic = None
         self.is_ready = False
         self.session_handle = None
+        self.lead_state = LeadState()
         self._running = True
         self._cleaned_up = False
 
@@ -249,7 +380,7 @@ class VoiceAgent:
                     "responseModalities": ["AUDIO"],
                     "speechConfig": {
                         "voiceConfig": {
-                            "prebuiltVoiceConfig": {"voiceName": "Puck"}
+                            "prebuiltVoiceConfig": {"voiceName": "Aoede"}
                         }
                     },
                     "temperature": 0.7,
@@ -340,7 +471,7 @@ class VoiceAgent:
         log.info("Triggering initial greeting...")
         await self.ws.send(json.dumps({
             "realtimeInput": {
-                "text": "The call has connected. Deliver your greeting immediately."
+                "text": "The call has connected. Greet the caller now as Jake from TrueAI Lab."
             }
         }))
 
@@ -355,7 +486,18 @@ class VoiceAgent:
             log.info(f"Tool call: {fn_name}({json.dumps(fn_args)})")
 
             if fn_name == "save_lead":
-                result = call_n8n_webhook(fn_args)
+                self.lead_state.merge(fn_args)
+                if self.lead_state.saved:
+                    result = {"success": True, "message": "Lead already saved successfully"}
+                elif self.lead_state.has_all_fields():
+                    result = call_n8n_webhook(self.lead_state.as_payload())
+                    if result.get("success"):
+                        self.lead_state.saved = True
+                else:
+                    result = {
+                        "success": False,
+                        "error": f"Missing required fields: {', '.join(self.lead_state.missing_fields())}",
+                    }
             else:
                 result = {"error": f"Unknown function: {fn_name}"}
 
@@ -369,6 +511,26 @@ class VoiceAgent:
             "toolResponse": {"functionResponses": responses}
         }))
         log.info("Tool response sent")
+
+    async def _maybe_save_lead_fallback(self):
+        if self.lead_state.saved or not self.lead_state.has_all_fields():
+            return
+
+        result = call_n8n_webhook(self.lead_state.as_payload())
+        if not result.get("success"):
+            return
+
+        self.lead_state.saved = True
+        log.info("Lead auto-saved by fallback webhook logic")
+        await self.ws.send(json.dumps({
+            "realtimeInput": {
+                "text": (
+                    "System note: the lead has already been saved successfully. "
+                    "Briefly confirm that an engineer will reach out within 24 hours, "
+                    "and do not ask for the same contact details again."
+                )
+            }
+        }))
 
     async def _receive_loop(self):
         """Core receive loop — handles all server messages with zero-latency patterns."""
@@ -411,11 +573,14 @@ class VoiceAgent:
                         text = sc["inputTranscription"]["text"]
                         if text.strip():
                             log.info(f"🎤 Caller: {text}")
+                            self.lead_state.consume_caller_text(text)
+                            await self._maybe_save_lead_fallback()
 
                     if "outputTranscription" in sc:
                         text = sc["outputTranscription"]["text"]
                         if text.strip():
                             log.info(f"🤖 Agent:  {text}")
+                            self.lead_state.update_expected_field(text)
 
                     if sc.get("turnComplete"):
                         log.debug("Turn complete")
