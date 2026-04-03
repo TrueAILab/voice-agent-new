@@ -540,7 +540,7 @@ class TwilioGeminiBridge:
             json.dumps(
                 {
                     "realtimeInput": {
-                        "text": "The phone call has connected. Greet the caller now as Jake from TrueAI Lab."
+                        "text": "The phone call has connected. Greet the caller now as Maya from TrueAI Lab."
                     }
                 }
             )
