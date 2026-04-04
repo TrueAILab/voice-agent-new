@@ -26,6 +26,7 @@ import requests
 import websockets
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
+from prompt_config import SERVER_PROMPT
 
 load_dotenv(override=True)
 
@@ -59,88 +60,25 @@ log = logging.getLogger("twilio-gemini-bridge")
 app = FastAPI(title="TrueAI Lab Twilio Gemini Bridge")
 
 
-SYSTEM_PROMPT = """You are Maya, the AI receptionist for TrueAI Lab. You sound like a real, experienced front-desk receptionist — warm, natural, confident, and never robotic or pushy.
+SYSTEM_PROMPT = SERVER_PROMPT
 
-HOW TO SPEAK
-- Keep responses short and conversational (1–2 sentences).
-- Never sound scripted or repetitive.
-- Use the caller’s name occasionally, not every sentence.
-- If asked, speak in casual Chennai Tamil.
 
-STARTING THE CALL
-- Always open with:
-  "Hi, this is Maya from TrueAI Lab. How can I help you today?"
-- Do NOT ask for contact details at the beginning. Just listen and help first.
+def _log_startup_config() -> None:
+    log.info("TrueAI Lab — Twilio Gemini Bridge starting up")
+    log.info(f"  Model       : {GEMINI_MODEL}")
+    log.info(f"  Gemini key  : {'set' if GEMINI_API_KEY else '*** MISSING ***'}")
+    log.info(f"  n8n webhook : {N8N_WEBHOOK_URL or '(not configured)'}")
+    log.info(
+        f"  Supabase    : "
+        f"{'configured' if SUPABASE_URL and SUPABASE_API_KEY else '(not configured — call logs will be skipped)'}"
+    )
+    log.info(f"  Public URL  : {PUBLIC_BASE_URL or '(auto-detect from request headers)'}")
+    log.info(f"  Port        : {PORT}")
 
-CORE CONVERSATION BEHAVIOR
-- Focus on helping the caller first. Answer questions, understand their need, respond naturally.
-- Once you understand their use case and the conversation is wrapping up, collect their contact details.
 
-WHEN USER EXPLAINS THEIR NEED
-- Respond warmly: "Got it — we definitely build solutions like that. Let me get your details so our team can reach out."
+_log_startup_config()
 
-PRICING
-- "It depends on what you’re building — our team will walk you through the best options."
 
-UNKNOWN QUESTIONS
-- "That’s a good one — let me have someone from the team reach out to you about that."
-
-═══════════════════════════════════════════
-DETAIL COLLECTION — EXACT SCRIPT (CRITICAL)
-═══════════════════════════════════════════
-Collect in this EXACT order, ONE question at a time.
-Use ONLY these exact phrasings — do not rephrase them:
-
-STEP 1 — NAME:
-  Ask: "May I have your name?"
-  After they answer, confirm: "Got it — just to confirm, that’s [Name], right?"
-  If they correct it, say: "Sorry about that — [Corrected Name], got it."
-
-STEP 2 — PHONE:
-  Ask: "What’s the best number to reach you at? Please include your country code."
-  If no country code: "Could you include your country code as well?"
-  Confirm by repeating the number back once.
-
-STEP 3 — EMAIL:
-  Ask: "And what’s a good email address for you?"
-  Read it back: "Got it — that’s [email], right?"
-
-STEP 4 — SAVE:
-  Once name, phone, and email are confirmed, say:
-  "Give me a moment — I’ll log your details so our team can reach out."
-  Then IMMEDIATELY call save_lead with all four fields.
-
-USE CASE: You already know it from the conversation. Do NOT ask again.
-
-═══════════════════════════════════════════
-EXAMPLE COLLECTION EXCHANGE (follow this pattern exactly)
-═══════════════════════════════════════════
-Maya:   "May I have your name?"
-Caller: "It’s Saravana."
-Maya:   "Got it — just to confirm, that’s Saravana, right?"
-Caller: "Yes."
-Maya:   "What’s the best number to reach you at? Please include your country code."
-Caller: "+91 98765 43210."
-Maya:   "Perfect. And what’s a good email address for you?"
-Caller: "saravana@gmail.com"
-Maya:   "Got it — that’s saravana@gmail.com, right?"
-Caller: "Yes."
-Maya:   "Give me a moment — I’ll log your details so our team can reach out."
-[call save_lead immediately]
-Maya:   "Perfect, you’re all set. Our team will be in touch soon. Anything else I can help with?"
-
-WEBHOOK RULES
-- Call save_lead ONLY after you have all four fields: name, phone, email, use_case.
-- Pass the use_case from the conversation — never leave it blank.
-- If save_lead fails, say: "I’m sorry about that — let me try that again." and retry once.
-- After success: "Perfect, you’re all set. Our team will be in touch soon."
-
-IMPORTANT RULES
-- Never ask for details in the middle of the conversation — help first, collect at the end.
-- Never ask the same detail twice once confirmed.
-- Never deviate from the EXACT question phrasing in the steps above.
-- Keep everything short, warm, and human.
-"""
 def call_n8n_webhook(lead_data: dict[str, Any]) -> dict[str, Any]:
     """POST lead data to n8n webhook. Returns success/error status."""
     if not N8N_WEBHOOK_URL:
@@ -496,6 +434,7 @@ class TwilioGeminiBridge:
         self.customer_phone_number: str | None = None
         self._user_buf: list[str] = []
         self._ai_buf: list[str] = []
+        self._finalized = False
 
     def _build_setup_message(self) -> dict[str, Any]:
         return {
@@ -618,7 +557,7 @@ class TwilioGeminiBridge:
             json.dumps(
                 {
                     "realtimeInput": {
-                        "text": "The phone call has connected. Greet the caller now as maya from TrueAI Lab."
+                        "text": "The phone call has connected. Greet the caller now as Maya from TrueAI Lab."
                     }
                 }
             )
@@ -874,6 +813,47 @@ class TwilioGeminiBridge:
         with contextlib.suppress(Exception):
             await self.twilio_ws.close()
 
+    async def _finalize_and_save(self) -> None:
+        """Flush conversation buffers, log call summary, and save to Supabase.
+        Idempotent — safe to call from both the normal path and the error handler."""
+        if self._finalized:
+            return
+        self._finalized = True
+
+        # Flush any remaining partial turns before saving
+        if self._user_buf:
+            self._flush_user_turn()
+        if self._ai_buf:
+            self._flush_ai_turn()
+
+        call_end_time = datetime.now(timezone.utc)
+        duration = 0
+        if self.call_start_time:
+            duration = max(0, int((call_end_time - self.call_start_time).total_seconds()))
+
+        ls = self.lead_state
+        log.info("─" * 54)
+        log.info(f"CALL ENDED  sid={self.call_sid}  duration={duration}s  turns={len(self.conversation)}")
+        log.info(f"  caller : {self.customer_phone_number or '(unknown)'}")
+        log.info(f"  name   : {ls.name!r}")
+        log.info(f"  phone  : {ls.phone!r}")
+        log.info(f"  email  : {ls.email!r}")
+        log.info(f"  case   : {ls.use_case!r}")
+        log.info(f"  saved  : {ls.saved}")
+        log.info("─" * 54)
+
+        if self.conversation:
+            await asyncio.to_thread(
+                save_call_log_sync,
+                self.call_sid or "",
+                self.customer_phone_number,
+                self.conversation,
+                self.call_start_time,
+                call_end_time,
+            )
+        else:
+            log.info(f"No conversation to log for call_sid={self.call_sid}")
+
     async def run(self) -> None:
         await self.connect_gemini()
 
@@ -892,26 +872,7 @@ class TwilioGeminiBridge:
         await asyncio.gather(*pending, return_exceptions=True)
         await asyncio.gather(*done, return_exceptions=True)
         await self.close()
-
-        # Flush any remaining partial turns
-        if self._user_buf:
-            self._flush_user_turn()
-        if self._ai_buf:
-            self._flush_ai_turn()
-
-        # Save call log to Supabase
-        call_end_time = datetime.now(timezone.utc)
-        if self.conversation:
-            await asyncio.to_thread(
-                save_call_log_sync,
-                self.call_sid or "",
-                self.customer_phone_number,
-                self.conversation,
-                self.call_start_time,
-                call_end_time,
-            )
-        else:
-            log.info(f"No conversation to log for call_sid={self.call_sid}")
+        await self._finalize_and_save()
 
 
 @app.get("/")
@@ -934,8 +895,14 @@ async def twilio_voice(request: Request) -> Response:
     stream_url = f"{http_base_to_ws_base(base_url)}/twilio/media"
     status_url = f"{base_url}/twilio/stream-status"
 
-    form = await request.form()
-    caller_phone = str(form.get("From") or request.query_params.get("From") or "")
+    # Safely extract caller phone — form() only works on POST with multipart/urlencoded
+    caller_phone = request.query_params.get("From", "")
+    if request.method == "POST":
+        try:
+            form = await request.form()
+            caller_phone = str(form.get("From") or caller_phone)
+        except Exception:
+            pass
 
     twiml = build_twiml(stream_url=stream_url, status_callback_url=status_url, caller_phone=caller_phone)
     return Response(content=twiml, media_type="application/xml")
@@ -945,7 +912,15 @@ async def twilio_voice(request: Request) -> Response:
 async def twilio_stream_status(request: Request) -> dict[str, Any]:
     raw_body = (await request.body()).decode("utf-8")
     payload = dict(parse_qsl(raw_body, keep_blank_values=True))
-    log.info(f"Twilio stream status: {payload}")
+    stream_status = payload.get("StreamStatus", "unknown")
+    call_sid = payload.get("CallSid", "")
+    log.info(f"Twilio stream [{stream_status}]  call_sid={call_sid}")
+    if stream_status == "stopped":
+        log.info(
+            f"  CallStatus={payload.get('CallStatus', '')}  "
+            f"ErrorCode={payload.get('ErrorCode', 'none')}  "
+            f"Timestamp={payload.get('Timestamp', '')}"
+        )
     return {"ok": True}
 
 
@@ -958,3 +933,4 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
     except Exception as exc:
         log.error(f"Bridge error: {exc}", exc_info=True)
         await bridge.close()
+        await bridge._finalize_and_save()

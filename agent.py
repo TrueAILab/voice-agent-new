@@ -28,6 +28,7 @@ import requests
 import sounddevice as sd
 import websockets
 from dotenv import load_dotenv
+from prompt_config import AGENT_PROMPT
 
 load_dotenv(override=True)
 
@@ -67,57 +68,7 @@ log = logging.getLogger("voice-agent")
 
 # ─── System Prompt ────────────────────────────────────────────
 
-
-SYSTEM_PROMPT = """You are maya, the AI receptionist for TrueAI Lab. You sound like a real, experienced front-desk receptionist - warm, natural, confident, and never robotic or pushy.
-
-HOW TO SPEAK
-- Keep every response short and conversational. Prefer 1-2 short sentences, and only go longer if the caller asks for more.
-- Never read out lists or sound scripted.
-- Never say things like "I have noted your details" or "I will proceed." Just do it and confirm naturally.
-- Use the caller's name occasionally, but not in every sentence.
-- Never repeat yourself.
-- If the caller asks you to speak in Tamil, switch to casual Chennai Tamil without any formal or ancient tamil usage.
-
-STARTING THE CALL
-- Always open with this exact short greeting: "Hi, this is maya from TrueAI Lab. How can I help you today?"
-- Do not ask for a name or phone number at the start. Just listen first.
-- Never repeat the full greeting if interrupted.
-
-ABOUT TRUEAI LAB
-- TrueAI Lab builds production-grade AI voice agents, workflow automation, and intelligent systems for businesses.
-- When someone asks if the company is good or trustworthy, answer warmly and confidently like a proud team member.
-- When someone asks about services or pricing, explain conversationally using your knowledge of TrueAI Lab. Never answer as a list.
-- If pricing comes up, say it depends on the complexity and an engineer will walk them through options that fit their needs.
-- Stay focused on the caller and their use case. Do not drift into generic AI explanations.
-
-COLLECTING DETAILS
-- Only collect details when the caller clearly wants follow-up, a meeting, a callback, or serious project discussion.
-- Collect in this order: full name, phone number, email address, then their specific use case.
-- Ask for only one detail at a time.
-- After the caller gives their name, confirm it naturally: "Got it - just to confirm, that's [Name], right?"
-- If they correct the name, acknowledge it naturally and use the corrected version.
-- After the caller gives their email, read it back naturally and confirm it once.
-- Always collect the phone number with country code. If it is missing, ask once naturally: "Could you include your country code as well?"
-- Never ask for the same detail again once it has been confirmed.
-
-WEBHOOK AND TOOL RULES
-- The only available tool is save_lead, which sends the existing webhook.
-- Calling save_lead is mandatory once you have name, phone, email, and use_case.
-- The moment you have all four fields, call save_lead before the final confirmation.
-- Before calling the tool, say naturally: "Just a moment" or "Let me check that for you."
-- Do not mention the tool or webhook to the caller.
-- If the tool fails, say: "I'm sorry about that - let me try that again."
-
-AFTER THE WEBHOOK IS DONE
-- Keep it minimal and natural.
-- After save_lead succeeds, say something like: "Perfect, you're all set. We'll be in touch soon. Do you need any other help today?"
-- Keep that short. Do not give a long closing unless the caller is ready to end the call.
-
-IMPORTANT RULES
-- Never ask more than one question at a time.
-- Never suggest booking a meeting unless the caller brings it up.
-- If they are not interested, be gracious and brief.
-"""
+SYSTEM_PROMPT = AGENT_PROMPT
 
 # ─── Audio Playback (non-blocking, interruptible) ────────────
 
@@ -313,13 +264,32 @@ def _extract_phone(text: str) -> str | None:
 
 def _clean_name(text: str) -> str:
     cleaned = re.sub(
-        r"^(my name is|this is|i am|i'm|im|it is|it's)\s+",
+        r"^(my name is|this is|i am|i'm|im|it is|it's|hi i'm|hello i'm|hey i'm)\s+",
         "",
         text.strip(),
         flags=re.IGNORECASE,
     )
+    # Stop before an email address so it doesn't bleed into the name
+    cleaned = re.split(r"\s*@|\s+at\s+\w+\.\w+", cleaned, maxsplit=1)[0]
+    # Strip digits — names don't have numbers
+    cleaned = re.sub(r"\d+", "", cleaned)
     cleaned = re.sub(r"[^\w\s'.-]", "", cleaned)
     return _normalize_spaces(cleaned)
+
+
+_GREETING_RE = re.compile(
+    r"^(hi\b|hello\b|hey\b|yeah\s+(hi|hello|okay)|good\s+(morning|afternoon|evening)|how\s+are\s+you)",
+    re.IGNORECASE,
+)
+
+
+def _is_greeting_or_question(text: str) -> bool:
+    """Return True if text is a greeting or short question — not a real use case."""
+    if _GREETING_RE.match(text):
+        return True
+    if text.endswith("?") and len(text.split()) <= 15:
+        return True
+    return False
 
 
 def _clean_use_case(text: str) -> str:
@@ -343,13 +313,23 @@ class LeadState:
 
     def update_expected_field(self, agent_text: str):
         text = agent_text.lower()
-        if any(phrase in text for phrase in ["full name", "your name", "who am i speaking with", "who's this"]):
+        if any(phrase in text for phrase in [
+            "may i have your name", "your name", "who am i speaking with", "who's this",
+            "can i grab your name", "what's your name", "full name", "first name",
+            "get your name", "just to confirm, that's",
+        ]) or re.search(r"\bname\b", text):
             self.expected_field = "name"
-        elif any(phrase in text for phrase in ["phone number", "best number", "reach you at"]):
+        elif any(phrase in text for phrase in [
+            "phone number", "best number", "reach you at", "contact number",
+            "number to reach", "country code",
+        ]):
             self.expected_field = "phone"
-        elif "email" in text:
+        elif any(phrase in text for phrase in ["email address", "email", "good email"]):
             self.expected_field = "email"
-        elif any(phrase in text for phrase in ["use case", "what do you want", "what would you like", "what should the voice agent do"]):
+        elif any(phrase in text for phrase in [
+            "use case", "what do you want", "what would you like",
+            "what should the voice agent do",
+        ]):
             self.expected_field = "use_case"
 
     def merge(self, data: dict):
@@ -370,14 +350,20 @@ class LeadState:
         if phone and not self.phone:
             self.phone = phone
 
-        if self.expected_field == "name" and not self.name:
-            self.name = _clean_name(text)
+        if self.expected_field == "name":
+            candidate = _clean_name(text)
+            # Always overwrite so a later accurate utterance replaces an earlier bad capture
+            if candidate and len(candidate) >= 2 and re.search(r"[a-zA-Z]", candidate):
+                self.name = candidate
         elif self.expected_field == "phone" and not self.phone and phone:
             self.phone = phone
         elif self.expected_field == "email" and not self.email and email:
             self.email = email
         elif self.expected_field == "use_case" and not self.use_case:
-            self.use_case = _clean_use_case(text)
+            cleaned = _clean_use_case(text)
+            # Don't store a greeting or short question as the use case
+            if cleaned and not _is_greeting_or_question(cleaned):
+                self.use_case = cleaned
 
     def has_all_fields(self) -> bool:
         return all([self.name, self.phone, self.email, self.use_case])
@@ -542,7 +528,7 @@ class VoiceAgent:
         log.info("Triggering initial greeting...")
         await self.ws.send(json.dumps({
             "realtimeInput": {
-                "text": "The call has connected. Greet the caller now as maya from TrueAI Lab."
+                "text": "The call has connected. Greet the caller now as Maya from TrueAI Lab."
             }
         }))
 
