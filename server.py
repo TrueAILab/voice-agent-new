@@ -16,7 +16,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import parse_qsl
 from xml.sax.saxutils import escape
@@ -34,6 +34,11 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-3.1-flash-live-preview")
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_API_KEY = os.getenv("SUPABASE_API_KEY", "")
+SUPABASE_USER_ID = os.getenv("SUPABASE_USER_ID", "")
+SUPABASE_AGENT_ID = os.getenv("SUPABASE_AGENT_ID", "")
 
 WS_ENDPOINT = (
     "wss://generativelanguage.googleapis.com/ws/"
@@ -59,84 +64,82 @@ SYSTEM_PROMPT = """You are Maya, the AI receptionist for TrueAI Lab. You sound l
 HOW TO SPEAK
 - Keep responses short and conversational (1–2 sentences).
 - Never sound scripted or repetitive.
-- Never repeat the same question again and again.
-- Use the caller's name occasionally, not every sentence.
+- Use the caller’s name occasionally, not every sentence.
 - If asked, speak in casual Chennai Tamil.
 
 STARTING THE CALL
 - Always open with:
   "Hi, this is Maya from TrueAI Lab. How can I help you today?"
-- Do NOT ask for details at the beginning.
+- Do NOT ask for contact details at the beginning. Just listen and help first.
 
-CORE CONVERSATION BEHAVIOR (VERY IMPORTANT)
-- Focus on helping the caller first.
-- Answer their questions, understand their problem, and respond naturally.
-- DO NOT ask for their details during the conversation.
-- DO NOT say "Shall I get your details" more than once.
-- Only ask for details at the very END of the conversation.
+CORE CONVERSATION BEHAVIOR
+- Focus on helping the caller first. Answer questions, understand their need, respond naturally.
+- Once you understand their use case and the conversation is wrapping up, collect their contact details.
 
 WHEN USER EXPLAINS THEIR NEED
-- Respond like:
-  "Got it — yeah, we actually build solutions like this. We should definitely be able to help you with that."
-- Be confident and reassuring.
+- Respond warmly: "Got it — we definitely build solutions like that. Let me get your details so our team can reach out."
 
 PRICING
-- "It depends on what you're building — my sales team will walk you through the best options."
+- "It depends on what you’re building — our team will walk you through the best options."
 
 UNKNOWN QUESTIONS
-- "That’s a good question — I might need to check that with my team. I can have someone reach out to you."
+- "That’s a good one — let me have someone from the team reach out to you about that."
 
-STRICT DETAIL COLLECTION RULE
-- Only ask for details ONCE and ONLY at the END of the conversation.
-- Ask ONLY if:
-  - The user shows interest
-  - OR asks for next steps
-  - OR conversation is naturally wrapping up
+═══════════════════════════════════════════
+DETAIL COLLECTION — EXACT SCRIPT (CRITICAL)
+═══════════════════════════════════════════
+Collect in this EXACT order, ONE question at a time.
+Use ONLY these exact phrasings — do not rephrase them:
 
-- Then say casually:
-  "Alright, I can have my team reach out to you — shall I get your details?"
+STEP 1 — NAME:
+  Ask: "May I have your name?"
+  After they answer, confirm: "Got it — just to confirm, that’s [Name], right?"
+  If they correct it, say: "Sorry about that — [Corrected Name], got it."
 
-- NEVER ask this again after asking once.
+STEP 2 — PHONE:
+  Ask: "What’s the best number to reach you at? Please include your country code."
+  If no country code: "Could you include your country code as well?"
+  Confirm by repeating the number back once.
 
-DETAIL COLLECTION FLOW
-- Collect one by one:
-  1. Name  
-  2. Phone (with country code)  
-  3. Email  
-  4. Use case (if not already clear)
+STEP 3 — EMAIL:
+  Ask: "And what’s a good email address for you?"
+  Read it back: "Got it — that’s [email], right?"
 
-- After name:
-  "Got it — just to confirm, that's [Name], right?"
+STEP 4 — SAVE:
+  Once name, phone, and email are confirmed, say:
+  "Give me a moment — I’ll log your details so our team can reach out."
+  Then IMMEDIATELY call save_lead with all four fields.
 
-- If phone missing country code:
-  "Could you include your country code as well?"
+USE CASE: You already know it from the conversation. Do NOT ask again.
 
-WEBHOOK FLOW (CRITICAL)
-- Once all 4 details are collected:
+═══════════════════════════════════════════
+EXAMPLE COLLECTION EXCHANGE (follow this pattern exactly)
+═══════════════════════════════════════════
+Maya:   "May I have your name?"
+Caller: "It’s Saravana."
+Maya:   "Got it — just to confirm, that’s Saravana, right?"
+Caller: "Yes."
+Maya:   "What’s the best number to reach you at? Please include your country code."
+Caller: "+91 98765 43210."
+Maya:   "Perfect. And what’s a good email address for you?"
+Caller: "saravana@gmail.com"
+Maya:   "Got it — that’s saravana@gmail.com, right?"
+Caller: "Yes."
+Maya:   "Give me a moment — I’ll log your details so our team can reach out."
+[call save_lead immediately]
+Maya:   "Perfect, you’re all set. Our team will be in touch soon. Anything else I can help with?"
 
-STEP 1 — SAY THIS NATURALLY:
-"Give me a minute — I’ll just log your details so my sales team can reach out to you."
-
-STEP 2 — CALL FUNCTION:
-Call save_lead with:
-- name
-- phone
-- email
-- use_case
-
-STEP 3 — AFTER SUCCESS:
-"Perfect, you're all set. My sales team will get in touch with you soon. Do you need any other help from me?"
-
-ERROR HANDLING
-- If tool fails:
-"I'm sorry about that — let me try that again."
+WEBHOOK RULES
+- Call save_lead ONLY after you have all four fields: name, phone, email, use_case.
+- Pass the use_case from the conversation — never leave it blank.
+- If save_lead fails, say: "I’m sorry about that — let me try that again." and retry once.
+- After success: "Perfect, you’re all set. Our team will be in touch soon."
 
 IMPORTANT RULES
-- Never ask for details in the middle of the conversation.
-- Never ask "shall I get your details" more than once.
-- Never rush to collect details.
-- First help → then close → then collect details.
-- Keep it human, smooth, and natural like a real receptionist.
+- Never ask for details in the middle of the conversation — help first, collect at the end.
+- Never ask the same detail twice once confirmed.
+- Never deviate from the EXACT question phrasing in the steps above.
+- Keep everything short, warm, and human.
 """
 def call_n8n_webhook(lead_data: dict[str, Any]) -> dict[str, Any]:
     """POST lead data to n8n webhook. Returns success/error status."""
@@ -167,6 +170,55 @@ def call_n8n_webhook(lead_data: dict[str, Any]) -> dict[str, Any]:
     except requests.RequestException as exc:
         log.error(f"Webhook failed: {exc}")
         return {"success": False, "error": str(exc)}
+
+
+def save_call_log_sync(
+    call_sid: str,
+    customer_phone: str | None,
+    conversation: list[dict],
+    call_start_time: datetime | None,
+    call_end_time: datetime,
+) -> None:
+    """Save completed call conversation to Supabase call_logs table."""
+    if not SUPABASE_URL or not SUPABASE_API_KEY:
+        log.warning("Supabase not configured - skipping call log")
+        return
+
+    transcript_text = "\n".join(
+        f"{turn['speaker']}: {turn['text']}" for turn in conversation
+    )
+    duration = 0
+    if call_start_time:
+        duration = max(0, int((call_end_time - call_start_time).total_seconds()))
+
+    payload = {
+        "user_id": SUPABASE_USER_ID,
+        "agent_id": SUPABASE_AGENT_ID,
+        "call_sid": call_sid or "",
+        "customer_phone_number": customer_phone,
+        "full_conversation": conversation,
+        "transcript_text": transcript_text,
+        "call_start_time": call_start_time.isoformat() if call_start_time else None,
+        "call_end_time": call_end_time.isoformat(),
+        "duration_seconds": duration,
+    }
+
+    try:
+        resp = requests.post(
+            f"{SUPABASE_URL}/rest/v1/call_logs",
+            json=payload,
+            headers={
+                "apikey": SUPABASE_API_KEY,
+                "Authorization": f"Bearer {SUPABASE_API_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        log.info(f"Call log saved to Supabase: call_sid={call_sid}, turns={len(conversation)}")
+    except requests.RequestException as exc:
+        log.error(f"Failed to save call log to Supabase: {exc}")
 
 
 def _normalize_spaces(text: str) -> str:
@@ -240,16 +292,22 @@ class LeadState:
     def update_expected_field(self, agent_text: str):
         text = agent_text.lower()
         if any(phrase in text for phrase in [
-            "full name", "your name", "who am i speaking with", "who's this",
-            "can i grab your name", "may i have your name", "what's your name",
-            "first name", "get your name", "i have your name",
+            "may i have your name", "your name", "who am i speaking with", "who's this",
+            "can i grab your name", "what's your name", "full name", "first name",
+            "get your name", "i have your name", "just to confirm, that's",
         ]):
             self.expected_field = "name"
-        elif any(phrase in text for phrase in ["phone number", "best number", "reach you at", "contact number"]):
+        elif any(phrase in text for phrase in [
+            "phone number", "best number", "reach you at", "contact number",
+            "number to reach", "country code",
+        ]):
             self.expected_field = "phone"
-        elif "email" in text:
+        elif any(phrase in text for phrase in ["email address", "email", "good email"]):
             self.expected_field = "email"
-        elif any(phrase in text for phrase in ["use case", "what do you want", "what would you like", "what should the voice agent do"]):
+        elif any(phrase in text for phrase in [
+            "use case", "what do you want", "what would you like",
+            "what should the voice agent do",
+        ]):
             self.expected_field = "use_case"
 
     def merge(self, data: dict[str, Any]):
@@ -330,9 +388,10 @@ def http_base_to_ws_base(http_base: str) -> str:
     return http_base
 
 
-def build_twiml(stream_url: str, status_callback_url: str) -> str:
+def build_twiml(stream_url: str, status_callback_url: str, caller_phone: str = "") -> str:
     escaped_stream_url = escape(stream_url, {'"': "&quot;"})
     escaped_status_url = escape(status_callback_url, {'"': "&quot;"})
+    escaped_caller = escape(caller_phone, {'"': "&quot;"})
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
@@ -340,6 +399,7 @@ def build_twiml(stream_url: str, status_callback_url: str) -> str:
         f'<Stream url="{escaped_stream_url}" statusCallback="{escaped_status_url}" '
         'statusCallbackMethod="POST">'
         '<Parameter name="agent" value="trueai-gemini" />'
+        f'<Parameter name="callerPhone" value="{escaped_caller}" />'
         "</Stream>"
         "</Connect>"
         "</Response>"
@@ -430,6 +490,12 @@ class TwilioGeminiBridge:
         self.mark_counter = 0
         self.lead_state = LeadState()
         self.session_handle: str | None = None
+        # Conversation logging
+        self.conversation: list[dict] = []
+        self.call_start_time: datetime | None = None
+        self.customer_phone_number: str | None = None
+        self._user_buf: list[str] = []
+        self._ai_buf: list[str] = []
 
     def _build_setup_message(self) -> dict[str, Any]:
         return {
@@ -518,6 +584,18 @@ class TwilioGeminiBridge:
             }
         }
 
+    def _flush_user_turn(self) -> None:
+        text = "".join(self._user_buf).strip()
+        if text:
+            self.conversation.append({"text": text, "speaker": "user"})
+        self._user_buf.clear()
+
+    def _flush_ai_turn(self) -> None:
+        text = "".join(self._ai_buf).strip()
+        if text:
+            self.conversation.append({"text": text, "speaker": "ai"})
+        self._ai_buf.clear()
+
     async def connect_gemini(self) -> None:
         if not GEMINI_API_KEY:
             raise RuntimeError("GEMINI_API_KEY is not configured")
@@ -540,7 +618,7 @@ class TwilioGeminiBridge:
             json.dumps(
                 {
                     "realtimeInput": {
-                        "text": "The phone call has connected. Greet the caller now as Maya from TrueAI Lab."
+                        "text": "The phone call has connected. Greet the caller now as maya from TrueAI Lab."
                     }
                 }
             )
@@ -644,7 +722,10 @@ class TwilioGeminiBridge:
                     start = msg.get("start", {})
                     self.stream_sid = msg.get("streamSid") or start.get("streamSid")
                     self.call_sid = start.get("callSid")
-                    log.info(f"Twilio stream started: {self.stream_sid}")
+                    self.call_start_time = datetime.now(timezone.utc)
+                    custom_params = start.get("customParameters", {})
+                    self.customer_phone_number = custom_params.get("callerPhone") or None
+                    log.info(f"Twilio stream started: {self.stream_sid}, caller={self.customer_phone_number}")
                     continue
 
                 if event == "media":
@@ -742,14 +823,24 @@ class TwilioGeminiBridge:
                         text = sc["inputTranscription"].get("text", "").strip()
                         if text:
                             log.info(f"Caller: {text}")
+                            self._user_buf.append(text)
                             self.lead_state.consume_caller_text(text)
                             await self.maybe_save_lead_fallback()
 
                     if "outputTranscription" in sc:
                         text = sc["outputTranscription"].get("text", "").strip()
                         if text:
+                            if self._user_buf:
+                                self._flush_user_turn()
                             log.info(f"Agent: {text}")
+                            self._ai_buf.append(text)
                             self.lead_state.update_expected_field(text)
+
+                    if sc.get("turnComplete"):
+                        if self._user_buf:
+                            self._flush_user_turn()
+                        if self._ai_buf:
+                            self._flush_ai_turn()
 
                 if "sessionResumptionUpdate" in msg:
                     update = msg["sessionResumptionUpdate"]
@@ -802,6 +893,26 @@ class TwilioGeminiBridge:
         await asyncio.gather(*done, return_exceptions=True)
         await self.close()
 
+        # Flush any remaining partial turns
+        if self._user_buf:
+            self._flush_user_turn()
+        if self._ai_buf:
+            self._flush_ai_turn()
+
+        # Save call log to Supabase
+        call_end_time = datetime.now(timezone.utc)
+        if self.conversation:
+            await asyncio.to_thread(
+                save_call_log_sync,
+                self.call_sid or "",
+                self.customer_phone_number,
+                self.conversation,
+                self.call_start_time,
+                call_end_time,
+            )
+        else:
+            log.info(f"No conversation to log for call_sid={self.call_sid}")
+
 
 @app.get("/")
 async def root() -> dict[str, Any]:
@@ -822,7 +933,11 @@ async def twilio_voice(request: Request) -> Response:
     base_url = build_public_base_url(request)
     stream_url = f"{http_base_to_ws_base(base_url)}/twilio/media"
     status_url = f"{base_url}/twilio/stream-status"
-    twiml = build_twiml(stream_url=stream_url, status_callback_url=status_url)
+
+    form = await request.form()
+    caller_phone = str(form.get("From") or request.query_params.get("From") or "")
+
+    twiml = build_twiml(stream_url=stream_url, status_callback_url=status_url, caller_phone=caller_phone)
     return Response(content=twiml, media_type="application/xml")
 
 

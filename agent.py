@@ -22,7 +22,7 @@ import queue
 import re
 import sys
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 import sounddevice as sd
@@ -36,6 +36,11 @@ load_dotenv(override=True)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "")
 MODEL = os.getenv("GEMINI_MODEL", "models/gemini-3.1-flash-live-preview")
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_API_KEY = os.getenv("SUPABASE_API_KEY", "")
+SUPABASE_USER_ID = os.getenv("SUPABASE_USER_ID", "")
+SUPABASE_AGENT_ID = os.getenv("SUPABASE_AGENT_ID", "")
 
 # Audio config — PCM 16-bit 16kHz mono (what Gemini expects/returns)
 SAMPLE_RATE = 16000
@@ -63,7 +68,7 @@ log = logging.getLogger("voice-agent")
 # ─── System Prompt ────────────────────────────────────────────
 
 
-SYSTEM_PROMPT = """You are Maya, the AI receptionist for TrueAI Lab. You sound like a real, experienced front-desk receptionist - warm, natural, confident, and never robotic or pushy.
+SYSTEM_PROMPT = """You are maya, the AI receptionist for TrueAI Lab. You sound like a real, experienced front-desk receptionist - warm, natural, confident, and never robotic or pushy.
 
 HOW TO SPEAK
 - Keep every response short and conversational. Prefer 1-2 short sentences, and only go longer if the caller asks for more.
@@ -74,7 +79,7 @@ HOW TO SPEAK
 - If the caller asks you to speak in Tamil, switch to casual Chennai Tamil without any formal or ancient tamil usage.
 
 STARTING THE CALL
-- Always open with this exact short greeting: "Hi, this is Maya from TrueAI Lab. How can I help you today?"
+- Always open with this exact short greeting: "Hi, this is maya from TrueAI Lab. How can I help you today?"
 - Do not ask for a name or phone number at the start. Just listen first.
 - Never repeat the full greeting if interrupted.
 
@@ -240,6 +245,54 @@ def call_n8n_webhook(lead_data: dict) -> dict:
         return {"success": False, "error": str(e)}
 
 
+def save_call_log_sync(
+    call_sid: str,
+    conversation: list[dict],
+    call_start_time: datetime | None,
+    call_end_time: datetime,
+) -> None:
+    """Save completed call conversation to Supabase call_logs table."""
+    if not SUPABASE_URL or not SUPABASE_API_KEY:
+        log.warning("Supabase not configured — skipping call log")
+        return
+
+    transcript_text = "\n".join(
+        f"{turn['speaker']}: {turn['text']}" for turn in conversation
+    )
+    duration = 0
+    if call_start_time:
+        duration = max(0, int((call_end_time - call_start_time).total_seconds()))
+
+    payload = {
+        "user_id": SUPABASE_USER_ID,
+        "agent_id": SUPABASE_AGENT_ID,
+        "call_sid": call_sid,
+        "customer_phone_number": None,
+        "full_conversation": conversation,
+        "transcript_text": transcript_text,
+        "call_start_time": call_start_time.isoformat() if call_start_time else None,
+        "call_end_time": call_end_time.isoformat(),
+        "duration_seconds": duration,
+    }
+
+    try:
+        resp = requests.post(
+            f"{SUPABASE_URL}/rest/v1/call_logs",
+            json=payload,
+            headers={
+                "apikey": SUPABASE_API_KEY,
+                "Authorization": f"Bearer {SUPABASE_API_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        log.info(f"Call log saved to Supabase: call_sid={call_sid}, turns={len(conversation)}")
+    except requests.RequestException as exc:
+        log.error(f"Failed to save call log to Supabase: {exc}")
+
+
 def _normalize_spaces(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
@@ -370,6 +423,24 @@ class VoiceAgent:
         self.lead_state = LeadState()
         self._running = True
         self._cleaned_up = False
+        # Conversation logging
+        self.conversation: list[dict] = []
+        self.call_start_time: datetime | None = None
+        self.call_sid: str = ""
+        self._user_buf: list[str] = []
+        self._ai_buf: list[str] = []
+
+    def _flush_user_turn(self) -> None:
+        text = "".join(self._user_buf).strip()
+        if text:
+            self.conversation.append({"text": text, "speaker": "user"})
+        self._user_buf.clear()
+
+    def _flush_ai_turn(self) -> None:
+        text = "".join(self._ai_buf).strip()
+        if text:
+            self.conversation.append({"text": text, "speaker": "ai"})
+        self._ai_buf.clear()
 
     def _build_setup_message(self) -> dict:
         """Build the BidiGenerateContentSetup message with all low-latency optimizations."""
@@ -471,7 +542,7 @@ class VoiceAgent:
         log.info("Triggering initial greeting...")
         await self.ws.send(json.dumps({
             "realtimeInput": {
-                "text": "The call has connected. Greet the caller now as Maya from TrueAI Lab."
+                "text": "The call has connected. Greet the caller now as maya from TrueAI Lab."
             }
         }))
 
@@ -542,6 +613,8 @@ class VoiceAgent:
                 if "setupComplete" in msg:
                     log.info("✓ Session ready")
                     self.is_ready = True
+                    self.call_start_time = datetime.now(timezone.utc)
+                    self.call_sid = f"local-{self.call_start_time.strftime('%Y%m%d%H%M%S')}"
                     # Immediately trigger the greeting — no delay
                     await self._trigger_initial_greeting()
                     continue
@@ -568,22 +641,30 @@ class VoiceAgent:
                                 sys.stdout.write(part["text"])
                                 sys.stdout.flush()
 
-                    # Transcription logging
+                    # Transcription logging + conversation buffering
                     if "inputTranscription" in sc:
-                        text = sc["inputTranscription"]["text"]
+                        text = sc["inputTranscription"].get("text", "")
                         if text.strip():
                             log.info(f"🎤 Caller: {text}")
+                            self._user_buf.append(text)
                             self.lead_state.consume_caller_text(text)
                             await self._maybe_save_lead_fallback()
 
                     if "outputTranscription" in sc:
-                        text = sc["outputTranscription"]["text"]
+                        text = sc["outputTranscription"].get("text", "")
                         if text.strip():
+                            if self._user_buf:
+                                self._flush_user_turn()
                             log.info(f"🤖 Agent:  {text}")
+                            self._ai_buf.append(text)
                             self.lead_state.update_expected_field(text)
 
                     if sc.get("turnComplete"):
                         log.debug("Turn complete")
+                        if self._user_buf:
+                            self._flush_user_turn()
+                        if self._ai_buf:
+                            self._flush_ai_turn()
 
                 # ─── Tool Calls ───────────────────────────────
                 if "toolCall" in msg:
@@ -700,7 +781,7 @@ class VoiceAgent:
             self.cleanup()
 
     def cleanup(self):
-        """Clean shutdown of audio resources."""
+        """Clean shutdown of audio resources and save call log."""
         if self._cleaned_up:
             return
 
@@ -716,6 +797,25 @@ class VoiceAgent:
             self.player.stop()
         except Exception as e:
             log.warning(f"Player cleanup error: {e}")
+
+        # Flush any remaining partial turns
+        if self._user_buf:
+            self._flush_user_turn()
+        if self._ai_buf:
+            self._flush_ai_turn()
+
+        # Save conversation to Supabase
+        if self.conversation:
+            call_end_time = datetime.now(timezone.utc)
+            save_call_log_sync(
+                call_sid=self.call_sid,
+                conversation=self.conversation,
+                call_start_time=self.call_start_time,
+                call_end_time=call_end_time,
+            )
+        else:
+            log.info("No conversation to log")
+
         log.info("Done.")
 
 
